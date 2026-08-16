@@ -1,0 +1,23 @@
+#include "cinderdb/wal.hpp"
+#include "cinderdb/protocol.hpp"
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <fcntl.h>
+#include <stdexcept>
+#include <system_error>
+#include <unistd.h>
+namespace cinderdb { namespace {
+constexpr std::array<unsigned char,4> magic{{'C','D','B','1'}}; constexpr std::size_t header_size{13};
+void put_u32(unsigned char* out, std::uint32_t value) { for(int i=3;i>=0;--i) { out[static_cast<std::size_t>(i)]=static_cast<unsigned char>(value&0xffU); value>>=8U; } }
+std::uint32_t get_u32(const unsigned char* in) { std::uint32_t v=0; for(std::size_t i=0;i<4;++i) v=(v<<8U)|in[i]; return v; }
+std::uint32_t checksum(const std::string_view data) { std::uint32_t h{2166136261U}; for(const char raw:data) { const auto c=static_cast<unsigned char>(raw); h^=c; h*=16777619U; } return h; }
+void write_all(const int fd, const unsigned char* data, std::size_t size) { while(size>0) { const ssize_t n=::write(fd,data,size); if(n<0) { if(errno==EINTR) continue; throw std::system_error(errno,std::generic_category(),"WAL write"); } if(n==0) throw std::runtime_error{"WAL write returned zero"}; const auto used=static_cast<std::size_t>(n); data+=used; size-=used; } }
+enum class ReadResult { complete, eof, partial };
+ReadResult read_exact(int fd,unsigned char* data,std::size_t size) { std::size_t done=0; while(done<size) { ssize_t n=::read(fd,data+done,size-done); if(n<0) {if(errno==EINTR) continue; throw std::system_error(errno,std::generic_category(),"WAL read");} if(n==0) return done==0?ReadResult::eof:ReadResult::partial; done+=static_cast<std::size_t>(n); } return ReadResult::complete; }
+} 
+WriteAheadLog::WriteAheadLog(std::string path) : path_{std::move(path)} { fd_=::open(path_.c_str(),O_CREAT|O_WRONLY|O_APPEND,0644); if(fd_<0) throw std::system_error(errno,std::generic_category(),"open WAL"); }
+WriteAheadLog::~WriteAheadLog(){ if(fd_>=0) ::close(fd_); }
+void WriteAheadLog::append(WalOperation op,std::string_view key,std::string_view value) { if(key.size()>max_request_line_size || value.size()>max_request_line_size) throw std::runtime_error{"WAL field too large"}; std::lock_guard lock{mutex_}; std::string record; record.resize(header_size+key.size()+value.size()+4U); auto* bytes=reinterpret_cast<unsigned char*>(record.data()); for(std::size_t i=0;i<magic.size();++i) bytes[i]=magic[i]; bytes[4]=static_cast<unsigned char>(op); put_u32(bytes+5,static_cast<std::uint32_t>(key.size())); put_u32(bytes+9,static_cast<std::uint32_t>(value.size())); std::copy(key.begin(),key.end(),record.begin()+static_cast<std::ptrdiff_t>(header_size)); std::copy(value.begin(),value.end(),record.begin()+static_cast<std::ptrdiff_t>(header_size+key.size())); const auto sum=checksum(std::string_view{record.data(),record.size()-4U}); put_u32(reinterpret_cast<unsigned char*>(record.data()+static_cast<std::ptrdiff_t>(record.size()-4U)),sum); write_all(fd_,reinterpret_cast<const unsigned char*>(record.data()),record.size()); if(::fsync(fd_)!=0) throw std::system_error(errno,std::generic_category(),"fsync WAL"); }
+void WriteAheadLog::replay(const std::function<void(WalOperation,std::string,std::string)>& apply) { const int input=::open(path_.c_str(),O_RDONLY); if(input<0) throw std::system_error(errno,std::generic_category(),"open WAL for replay"); try { for(;;) { std::array<unsigned char,header_size> header{}; const auto h=read_exact(input,header.data(),header.size()); if(h==ReadResult::eof || h==ReadResult::partial) break; if(!std::equal(magic.begin(),magic.end(),header.begin()) || (header[4]!=static_cast<unsigned char>(WalOperation::put) && header[4]!=static_cast<unsigned char>(WalOperation::erase))) throw std::runtime_error{"corrupt WAL record header"}; const auto key_size=get_u32(header.data()+5); const auto value_size=get_u32(header.data()+9); if(key_size>max_request_line_size || value_size>max_request_line_size) throw std::runtime_error{"corrupt WAL record length"}; std::string payload; payload.resize(static_cast<std::size_t>(key_size)+static_cast<std::size_t>(value_size)+4U); const auto p=read_exact(input,reinterpret_cast<unsigned char*>(payload.data()),payload.size()); if(p!=ReadResult::complete) break; std::string combined; combined.reserve(header.size()+payload.size()); combined.append(reinterpret_cast<const char*>(header.data()),header.size()); combined+=payload; if(checksum(std::string_view{combined.data(),combined.size()-4U})!=get_u32(reinterpret_cast<const unsigned char*>(combined.data()+static_cast<std::ptrdiff_t>(combined.size()-4U)))) throw std::runtime_error{"corrupt WAL checksum"}; apply(static_cast<WalOperation>(header[4]),payload.substr(0,key_size),payload.substr(key_size,value_size)); } } catch(...) { ::close(input); throw; } ::close(input); }
+}  // namespace cinderdb

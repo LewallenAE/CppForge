@@ -1,0 +1,5 @@
+2026-08-15T10:15:01 INFO auth User login succeeded
+THIS IS BAD
+2026-08-15T10:15:03 ERROR payments Payment processing failed
+2026-08-15T10:15:07 WARN inventory Stock level low
+2026-08-15T10:15:12 INFO payments Payment completed

@@ -1,0 +1,15 @@
+/build/
+/build-*/
+/cmake-build-*/
+/cinderdb
+*.o
+*.a
+*.so
+*.wal
+*.benchmark
+*.profraw
+*.profdata
+.idea/
+.vscode/
+*~
+.DS_Store

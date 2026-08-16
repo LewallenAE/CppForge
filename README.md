@@ -18,7 +18,7 @@ The projects are intentionally progressive. Each one adds another systems bounda
 |---|---|---|
 | [LogForge](./LogForge) | Shipped v1 | Streaming I/O, parsing, STL, testing, performance |
 | [TaskForge](./TaskForge) | Shipped v1 | Concurrency, bounded queues, worker pools, synchronization |
-| [CinderDB](./CinderDB) | In Development | TCP networking, concurrent state, persistence, recovery |
+| [CinderDB](./CinderDB) | Shipped v1 | TCP networking, concurrent state, WAL persistence, recovery |
 | [EmberMQ](./EmberMQ) | In Progress | Integrated C++ systems engineering / message-broker architecture |
 
 ---
@@ -147,50 +147,130 @@ Scaling was measured rather than assumed; higher worker counts did not produce l
 
 **Concurrent Networked Key-Value Storage Engine**
 
-CinderDB is the networking and storage stage of the project ladder.
+CinderDB is a C++20 TCP key-value service combining networking, concurrency, explicit OS-resource ownership, and durable storage.
 
-It is being built as a small TCP key-value service rather than an attempt to recreate Redis or another production database.
+It supports persistent client connections and a small newline-framed protocol:
 
-The architecture is centered around:
+```text
+PUT <key> <value>
+GET <key>
+DELETE <key>
+```
+
+### Architecture
 
 ```text
 Clients
    │
    ▼
-TCP Socket Layer
+TCP Listener
+   │
+   ▼
+Bounded Connection Queue
+   │
+   ▼
+Worker Pool
    │
    ▼
 Protocol Parser
    │
    ▼
-Concurrent Execution
+Thread-Safe Key/Value Store
    │
    ▼
-Key / Value Store
-   │
-   ▼
-Persistence
+Write-Ahead Log
 ```
 
-### Development targets
+### Engineering focus
 
 - POSIX TCP sockets
-- newline-framed request protocol
-- `PUT`, `GET`, and `DELETE`
-- multiple concurrent clients
-- explicit file-descriptor ownership
-- RAII resource wrappers
+- persistent connections
+- newline framing
+- partial-read handling
+- bounded request sizes
+- fixed worker pool
+- bounded connection queue
 - thread-safe in-memory state
+- move-only RAII file-descriptor ownership
 - append-only write-ahead logging
-- restart recovery
-- malformed-request handling
-- graceful shutdown
-- concurrency stress tests
-- sanitizer validation
-- network load testing
-- latency and throughput measurement
+- `fsync`-before-ack durability
+- startup recovery
+- incomplete-tail handling
+- WAL corruption detection
+- graceful `SIGINT` / `SIGTERM` shutdown
+- ASan / UBSan
+- ThreadSanitizer
+- concurrent socket testing
+- localhost load testing
 
-CinderDB will only be marked **Shipped v1** once networking, persistence, recovery, concurrency validation, sanitizers, and load testing have all passed.
+### Ownership
+
+File descriptors are wrapped in a move-only `UniqueFd` abstraction.
+
+The wrapper:
+
+- cannot be copied
+- can transfer ownership through moves
+- closes the descriptor deterministically on destruction
+
+The server owns its listener, worker threads, connection queue, accept thread, WAL, and store without detached threads or raw owning pointers.
+
+### Durability model
+
+Mutating operations follow:
+
+```text
+append WAL record
+        ↓
+fsync WAL
+        ↓
+mutate in-memory state
+        ↓
+send OK
+```
+
+The WAL contains structured records with checksums.
+
+During recovery:
+
+- valid records are replayed in order
+- an incomplete final record is ignored
+- corruption in a complete record causes recovery to fail rather than silently accepting damaged state
+
+### Validation
+
+CinderDB passed:
+
+```text
+Debug build        PASS
+Release build      PASS
+ASan / UBSan       PASS
+ThreadSanitizer    PASS
+Socket integration PASS
+Restart recovery   PASS
+```
+
+Concurrent validation included:
+
+```text
+8 TCP clients
+640 persisted mutations / reads
+restart verification
+0 protocol failures
+0 crashes
+0 deadlocks
+```
+
+### Measured performance
+
+Release build on localhost WSL2 with 16 server workers and 16 clients:
+
+| Workload | Operations | Throughput | Errors |
+|---|---:|---:|---:|
+| Missing-key GET | 32,000 | 1,347 ops/s | 0 |
+| Durable PUT (`fsync` per mutation) | 3,200 | 249 ops/s | 0 |
+
+The durable-write result intentionally reflects the cost of serialized `fsync`-before-ack semantics rather than hiding durability behind buffering.
 
 [View CinderDB →](./CinderDB)
 
